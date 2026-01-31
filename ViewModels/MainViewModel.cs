@@ -5,9 +5,7 @@ using Microsoft.Win32;
 using System;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
-using System.Collections.Specialized;
 using System.ComponentModel;
-using System.IO;
 using System.Linq;
 using System.Runtime.CompilerServices;
 using System.Runtime.Serialization;
@@ -70,6 +68,14 @@ namespace pdf_chat_app.ViewModels
         // Synonyms (free API)
         private static readonly HttpClient _http = new HttpClient();
         private readonly Dictionary<string, List<string>> _synCache = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
+
+        // =========================
+        // LLM (RAG) - minimal add
+        // =========================
+        private RagChatService _rag;                 // LLM: RAG engine
+        private bool _ragIndexed = false;            // LLM: whether current _pages are indexed
+        private string _ragIndexFingerprint = "";    // LLM: to detect when pages changed
+        private List<ChatTurn> _chatHistory = new List<ChatTurn>(); // LLM: short conversation memory
 
         // =========================
         // Bindings
@@ -165,6 +171,9 @@ namespace pdf_chat_app.ViewModels
             LoadWebsiteCommand = new RelayCommand(async o => await LoadWebsiteAsync());
             NewChatCommand = new RelayCommand(o => NewChat());
 
+            // LLM: initialize if key exists (no UI change)
+            TryInitRag();
+
             Messages.Add(new ChatMessage
             {
                 Role = ChatRole.Assistant,
@@ -243,7 +252,8 @@ namespace pdf_chat_app.ViewModels
                 }
                 else
                 {
-                    answer = await AnswerWithRetrievalAsync(text);
+                    // LLM: Use RAG for General questions (fallback to old retrieval if LLM not configured)
+                    answer = await AnswerWithLLMOrFallbackAsync(text);
                 }
 
                 Messages.Remove(typing);
@@ -303,6 +313,9 @@ namespace pdf_chat_app.ViewModels
                     _pages = PdfTextService.ReadAllPages(SelectedPdfPath);
                     BuildDocVocabulary();
 
+                    // LLM: mark index dirty (no async change here)
+                    MarkRagDirty();
+
                     Messages.Add(new ChatMessage
                     {
                         Role = ChatRole.Assistant,
@@ -313,6 +326,8 @@ namespace pdf_chat_app.ViewModels
                 {
                     _pages = new List<PageText>();
                     _docVocab = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+                    MarkRagDirty();
 
                     Messages.Add(new ChatMessage
                     {
@@ -341,9 +356,10 @@ namespace pdf_chat_app.ViewModels
 
                 try
                 {
-                    // You must implement this service (I can provide it next)
                     _pages = DocxTextService.ReadAllPages(SelectedWordPath);
                     BuildDocVocabulary();
+
+                    MarkRagDirty();
 
                     Messages.Add(new ChatMessage
                     {
@@ -355,6 +371,8 @@ namespace pdf_chat_app.ViewModels
                 {
                     _pages = new List<PageText>();
                     _docVocab = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+                    MarkRagDirty();
 
                     Messages.Add(new ChatMessage
                     {
@@ -377,9 +395,10 @@ namespace pdf_chat_app.ViewModels
 
             try
             {
-                // You must implement this service (I can provide it next)
                 _pages = await WebTextService.LoadChunksAsync(WebsiteUrl);
                 BuildDocVocabulary();
+
+                MarkRagDirty();
 
                 Messages.Add(new ChatMessage
                 {
@@ -391,6 +410,8 @@ namespace pdf_chat_app.ViewModels
             {
                 _pages = new List<PageText>();
                 _docVocab = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+                MarkRagDirty();
 
                 Messages.Add(new ChatMessage
                 {
@@ -404,6 +425,9 @@ namespace pdf_chat_app.ViewModels
         {
             Messages.Clear();
             _lastUserQuestion = "";
+
+            // LLM: reset chat memory, keep index
+            _chatHistory = new List<ChatTurn>();
 
             Messages.Add(new ChatMessage
             {
@@ -504,10 +528,8 @@ Tip:
 
             var enriched = await EnrichQueryAsync(keyword.Trim());
 
-            // Try expanded first
             var hits = PdfSearchService.Search(_pages, enriched.ExpandedQuery, 8);
 
-            // If expansion made it worse, fallback to corrected-only
             if (hits == null || hits.Count == 0)
                 hits = PdfSearchService.Search(_pages, enriched.CorrectedQuery, 8);
 
@@ -527,6 +549,29 @@ Tip:
 
             sb.AppendLine("Try: summary page " + hits[0].PageNumber);
             return sb.ToString().Trim();
+        }
+
+        // LLM: new method - uses RagChatService if configured, else fallback
+        private async Task<string> AnswerWithLLMOrFallbackAsync(string question)
+        {
+            // If LLM not configured, keep your old behavior
+            if (_rag == null)
+                return await AnswerWithRetrievalAsync(question);
+
+            // Ensure RAG index exists for current content
+            await EnsureRagIndexAsync();
+
+            if (!_rag.HasIndex)
+                return await AnswerWithRetrievalAsync(question);
+
+            // Add to LLM chat memory
+            _chatHistory.Add(new ChatTurn { Role = "user", Content = question });
+
+            string reply = await _rag.AskAsync(question, _chatHistory, 4);
+
+            _chatHistory.Add(new ChatTurn { Role = "assistant", Content = reply });
+
+            return reply;
         }
 
         private async Task<string> AnswerWithRetrievalAsync(string question)
@@ -655,6 +700,71 @@ Tip:
         }
 
         // =========================
+        // LLM helpers (minimal)
+        // =========================
+        private void TryInitRag()
+        {
+            try
+            {
+                string apiKey = Environment.GetEnvironmentVariable("OPENAI_API_KEY");
+                if (string.IsNullOrWhiteSpace(apiKey))
+                {
+                    _rag = null;
+                    return;
+                }
+
+                var llm = new LlmClient(new HttpClient(), "https://api.openai.com/v1/", apiKey);
+
+                // Change these only if needed
+                _rag = new RagChatService(llm, "text-embedding-3-small", "gpt-4o-mini");
+                _ragIndexed = false;
+                _ragIndexFingerprint = "";
+            }
+            catch
+            {
+                _rag = null;
+            }
+        }
+
+        private void MarkRagDirty()
+        {
+            _ragIndexed = false;
+            _ragIndexFingerprint = "";
+            _chatHistory = new List<ChatTurn>();
+        }
+
+        private async Task EnsureRagIndexAsync()
+        {
+            if (_rag == null) return;
+            if (_pages == null || _pages.Count == 0) return;
+
+            string fp = ComputePagesFingerprint();
+            if (_ragIndexed && string.Equals(fp, _ragIndexFingerprint, StringComparison.Ordinal))
+                return;
+
+            // Build index from current _pages (requires RagChatService.IndexPagesAsync method)
+            await _rag.IndexPagesAsync(_pages);
+
+            _ragIndexed = true;
+            _ragIndexFingerprint = fp;
+
+            // Reset chat history when doc changes
+            _chatHistory = new List<ChatTurn>();
+        }
+
+        private string ComputePagesFingerprint()
+        {
+            // Simple stable fingerprint: source + count + first/last page lengths
+            // avoids heavy hashing; good enough to detect reloads
+            int count = _pages != null ? _pages.Count : 0;
+            int firstLen = (count > 0 && _pages[0] != null && _pages[0].Text != null) ? _pages[0].Text.Length : 0;
+            int lastLen = (count > 0 && _pages[count - 1] != null && _pages[count - 1].Text != null) ? _pages[count - 1].Text.Length : 0;
+
+            return ActiveSource.ToString() + "|" + count + "|" + firstLen + "|" + lastLen + "|" +
+                   (SelectedPdfPath ?? "") + "|" + (SelectedWordPath ?? "") + "|" + (WebsiteUrl ?? "");
+        }
+
+        // =========================
         // Query enrichment (safer)
         // =========================
         private class EnrichedQuery
@@ -677,7 +787,6 @@ Tip:
 
             string correctedQuery = string.Join(" ", correctedTerms.ToArray());
 
-            // Expand only a little, and only for "content-ish" words
             var expanded = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
             for (int i = 0; i < correctedTerms.Count; i++)
@@ -707,7 +816,6 @@ Tip:
             if (w.Length <= 2) return true;
             if (char.IsDigit(w[0])) return true;
 
-            // small list is enough
             string[] stop = new string[] {
                 "the","a","an","and","or","but","to","of","in","on","for","with","by","as","at","is","are","was","were",
                 "be","been","being","this","that","these","those","it","its","from","into","about"
@@ -743,7 +851,6 @@ Tip:
             if (_docVocab == null || _docVocab.Count == 0) return term;
             if (_docVocab.Contains(term)) return term;
 
-            // Don’t “correct” numbers / short words
             if (term.Length <= 3) return term;
             if (char.IsDigit(term[0])) return term;
 
